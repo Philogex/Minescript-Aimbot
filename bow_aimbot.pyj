@@ -4,6 +4,7 @@ Double = JavaClass("java.lang.Double")
 Minecraft = JavaClass("net.minecraft.client.Minecraft")
 Math = JavaClass("java.lang.Math")
 BowItem = JavaClass("net.minecraft.world.item.BowItem")
+JString = JavaClass("java.lang.String")
 
 def _vec3_ctor():
     V = JavaClass("net.minecraft.world.phys.Vec3")
@@ -20,15 +21,18 @@ MAX_TARGET_DISTANCE = 60.0
 FULL_DRAW_THRESHOLD = 1.0
 DRAW_EPS = 0.01
 AIM_CONE_DEGREES = 8.0
-REPEAT_SHOTS_WHEN_ACTIVE = False
+REPEAT_SHOTS_WHEN_ACTIVE = True
 RELEASE_DELAY_TICKS = 2
 POST_RELEASE_HOLD_TICKS = 2
-LEAD_EXTRA_TICKS = 1.0
-N_AVG_SAMPLES = 6
+LEAD_EXTRA_TICKS = 4.0
+N_AVG_SAMPLES = 4
 ARROW_GRAVITY = 0.05
 ARROW_DRAG = 0.99
 ARROW_SPEED_SCALE = 3.00
-TARGET_Y_BIAS = 0.30
+VELOCITY_INSTANT_WEIGHT = 0.2
+TARGET_Y_BIAS = 0.50
+VELOCITY_SMOOTHING = "avg"   # one of: latest, ema, avg
+VELOCITY_EMA_ALPHA = 0.6
 
 # ------------------------------
 # don't touch
@@ -38,6 +42,7 @@ ACTIVE = True
 
 mc = Minecraft.getInstance()
 _velocity_history = {}
+_velocity_ema = {}
 
 _current_target = None
 _aiming = False
@@ -65,9 +70,16 @@ def _vec_to_tuple(v):
         return (float(v.x), float(v.y), float(v.z))
     except:
         try:
-            return (float(v[0]), float(v[1]), float(v[2]))
+            return (float (v[0]), float(v[1]), float(v[2]))
         except:
             return (0.0, 0.0, 0.0)
+        
+def _vel_tuple(entity):
+    try:
+        v = entity.getDeltaMovement()
+        return (float(v.x), float(v.y), float(v.z))
+    except:
+        return (0.0, 0.0, 0.0)
 
 def _view_vec_from_rot(ent):
     try:
@@ -139,6 +151,63 @@ def _avg_velocity_for(target, window_N=10):
         return (sx * inv, sy * inv, sz * inv)
     except Exception as e:
         return (0.0, 0.0, 0.0)
+
+def _push_velocity_sample(target, inst_tuple, window_N):
+    try:
+        try:
+            key = target.getUUID()
+        except:
+            key = target.getId()
+        if key not in _velocity_history:
+            _velocity_history[key] = []
+        hist = _velocity_history[key]
+        hist.append(inst_tuple)
+        if len(hist) > window_N:
+            hist.pop(0)
+        return key
+    except:
+        return None
+
+def _avg_from_history(key):
+    hist = _velocity_history.get(key, [])
+    if not hist:
+        return (0.0, 0.0, 0.0)
+    sx = 0.0
+    sy = 0.0
+    sz = 0.0
+    n = 0
+    for v in hist:
+        try:
+            sx += v[0]
+            sy += v[1]
+            sz += v[2]
+            n += 1
+        except:
+            pass
+    if n == 0:
+        return (0.0, 0.0, 0.0)
+    inv = 1.0 / n
+    return (sx*inv, sy*inv, sz*inv)
+
+def _smoothed_velocity_for(target, window_N):
+    inst = _vel_tuple(target)
+    key = _push_velocity_sample(target, inst, window_N)
+    mode = VELOCITY_SMOOTHING.lower() if type(VELOCITY_SMOOTHING) else "avg"
+    if mode == "latest":
+        return inst
+    if mode == "ema":
+        alpha = float(VELOCITY_EMA_ALPHA)
+        if key is None:
+            return inst
+        prev = _velocity_ema.get(key, inst)
+        vx = alpha*inst[0] + (1.0-alpha)*prev[0]
+        vy = alpha*inst[1] + (1.0-alpha)*prev[1]
+        vz = alpha*inst[2] + (1.0-alpha)*prev[2]
+        _velocity_ema[key] = (vx, vy, vz)
+        return _velocity_ema[key]
+    if key is None:
+        return inst
+    return _avg_from_history(key)
 
 def _pos_tuple(entity):
     try:
@@ -246,8 +315,14 @@ def lock_on(player, target):
     try:
         shooter_pos = _pos_tuple(player)
         tp = _pos_tuple(target)
-        target_pos = (tp[0], tp[1] - TARGET_Y_BIAS, tp[2])
-        target_vel = _avg_velocity_for(target, N_AVG)
+        target_pos = (tp[0], tp[1] + TARGET_Y_BIAS, tp[2])
+        vel_smooth = _smoothed_velocity_for(target, N_AVG)
+        inst = _vel_tuple(target)
+        w = float(VELOCITY_INSTANT_WEIGHT)
+        iw = 1.0 - w
+        target_vel = (inst[0]*w + vel_smooth[0]*iw,
+                      inst[1]*w + vel_smooth[1]*iw,
+                      inst[2]*w + vel_smooth[2]*iw)
     except Exception as e:
         try:
             m.echo("[aim] pos/vel fetch failed: " + str(e))
@@ -268,7 +343,9 @@ def lock_on(player, target):
                 ay = hist[-1][1] - hist[-2][1]
                 az = hist[-1][2] - hist[-2][2]
             else:
-                ax = ay = az = 0.0
+                ax = 0.0
+                ay = 0.0
+                az = 0.0
         except:
             ax = ay = az = 0.0
         tlead = float(RELEASE_DELAY_TICKS) + _get_latency_ticks() + float(LEAD_EXTRA_TICKS)
@@ -523,7 +600,6 @@ def _on_tick(event):
         return
 
     try:
-        _avg_velocity_for(_current_target)
         spd = _bow_speed(mc.player)
         if spd is not None and (spd / ARROW_SPEED_SCALE) >= (FULL_DRAW_THRESHOLD - DRAW_EPS):
             res = lock_on(mc.player, _current_target)
@@ -556,3 +632,25 @@ if _tick_listener is None:
     except:
         ck = 'O'
     m.echo(f"[Bow Aimbot] Lock: Mouse1  Cancel: {ck}")
+    try:
+        jobs = m.job_info()
+        self_job = None
+        for j in jobs:
+            if j.self:
+                self_job = j
+                break
+        if self_job is not None:
+            for arg in self_job.command:
+                try:
+                    if arg.startswith("--vel-mode="):
+                        VELOCITY_SMOOTHING = arg.split("=",1)[1]
+                    elif arg.startswith("--vel-alpha="):
+                        VELOCITY_EMA_ALPHA = float(arg.split("=",1)[1])
+                    elif arg.startswith("--n-avg="):
+                        N_AVG_SAMPLES = int(float(arg.split("=",1)[1]))
+                    elif arg.startswith("--vel-instant="):
+                        VELOCITY_INSTANT_WEIGHT = float(arg.split("=",1)[1])
+                except:
+                    pass
+    except:
+        pass
