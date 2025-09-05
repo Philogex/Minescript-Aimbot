@@ -1,0 +1,558 @@
+import system.pyj.minescript as m
+
+Double = JavaClass("java.lang.Double")
+Minecraft = JavaClass("net.minecraft.client.Minecraft")
+Math = JavaClass("java.lang.Math")
+BowItem = JavaClass("net.minecraft.world.item.BowItem")
+
+def _vec3_ctor():
+    V = JavaClass("net.minecraft.world.phys.Vec3")
+    return lambda x,y,z: V(x, y, z)
+Vec3 = _vec3_ctor()
+
+# ------------------------------
+# config
+# ------------------------------
+
+CANCEL_HOTKEY = 79 # O/o
+
+MAX_TARGET_DISTANCE = 60.0
+FULL_DRAW_THRESHOLD = 1.0
+DRAW_EPS = 0.01
+AIM_CONE_DEGREES = 8.0
+REPEAT_SHOTS_WHEN_ACTIVE = False
+RELEASE_DELAY_TICKS = 2
+POST_RELEASE_HOLD_TICKS = 2
+LEAD_EXTRA_TICKS = 1.0
+N_AVG_SAMPLES = 6
+ARROW_GRAVITY = 0.05
+ARROW_DRAG = 0.99
+ARROW_SPEED_SCALE = 3.00
+TARGET_Y_BIAS = 0.30
+
+# ------------------------------
+# don't touch
+# ------------------------------
+
+ACTIVE = True
+
+mc = Minecraft.getInstance()
+_velocity_history = {}
+
+_current_target = None
+_aiming = False
+_tick_listener = None
+_lock_on_active = False
+_hold_ticks_remaining = 0
+_hold_yaw = 0.0
+_hold_pitch = 0.0
+
+def _get_latency_ticks():
+  try:
+    conn = mc.getConnection()
+    if conn is None:
+      return 0.0
+    info = conn.getPlayerInfo(mc.player.getUUID())
+    if info is None:
+      return 0.0
+    ms = info.getLatency()
+    return float(ms) / 50.0
+  except:
+    return 0.0
+
+def _vec_to_tuple(v):
+    try:
+        return (float(v.x), float(v.y), float(v.z))
+    except:
+        try:
+            return (float(v[0]), float(v[1]), float(v[2]))
+        except:
+            return (0.0, 0.0, 0.0)
+
+def _view_vec_from_rot(ent):
+    try:
+        yaw_deg = ent.getYRot()
+        pitch_deg = ent.getXRot()
+        yr = Math.toRadians(yaw_deg)
+        pr = Math.toRadians(pitch_deg)
+        cp = Math.cos(pr)
+        x = -Math.sin(yr) * cp
+        y = -Math.sin(pr)
+        z = Math.cos(yr) * cp
+        return (float(x), float(y), float(z))
+    except:
+        return (0.0, 0.0, 1.0)
+
+def _bow_speed(player):
+    stack = player.getMainHandItem()
+    if stack is None or stack.isEmpty():
+        return None
+
+    item = stack.getItem()
+
+    if BowItem != type(item):
+        return None
+
+    try:
+        if not player.isUsingItem():
+            return 0.0
+    except:
+        pass
+
+    use_ticks = item.getUseDuration(stack, player) - player.getUseItemRemainingTicks()
+
+    f = float(use_ticks) / 20.0
+    f = (f * f + f * 2.0) / 3.0
+    if f > 1.0:
+        f = 1.0
+
+    return f * ARROW_SPEED_SCALE
+
+def _avg_velocity_for(target, window_N=10):
+    try:
+        try:
+            key = target.getUUID()
+        except:
+            key = target.getId()
+
+        if key not in _velocity_history:
+            _velocity_history[key] = []
+
+        v_now = target.getDeltaMovement()
+        vx, vy, vz = _vec_to_tuple(v_now)
+        hist = _velocity_history[key]
+        hist.append((vx, vy, vz))
+        if len(hist) > window_N:
+            hist.pop(0)
+
+        sx = 0.0
+        sy = 0.0
+        sz = 0.0
+        for v in hist:
+            try:
+                sx += v[0]; sy += v[1]; sz += v[2]
+            except:
+                sx += getattr(v, 'x', 0.0)
+                sy += getattr(v, 'y', 0.0)
+                sz += getattr(v, 'z', 0.0)
+        inv = 1.0 / len(hist)
+        return (sx * inv, sy * inv, sz * inv)
+    except Exception as e:
+        return (0.0, 0.0, 0.0)
+
+def _pos_tuple(entity):
+    try:
+        p = entity.getEyePosition()
+    except:
+        try:
+            p = entity.getBoundingBox().getCenter()
+        except:
+            p = entity.position()
+    return (float(p.x), float(p.y), float(p.z))
+
+def _solve_ballistic_dir(shooter_pos, target_pos, target_vel, arrow_speed):
+    g = ARROW_GRAVITY
+    sx, sy, sz = shooter_pos
+    tx, ty, tz = target_pos
+    vx, vy, vz = target_vel
+
+    dx0 = tx - sx
+    dy0 = ty - sy
+    dz0 = tz - sz
+    dist0 = Math.sqrt(dx0*dx0 + dy0*dy0 + dz0*dz0)
+    if arrow_speed <= 0.01:
+        return None
+    t_min = 1.0
+    t_guess = dist0 / max(arrow_speed, 0.01)
+    t_max = max(12.0, t_guess * 3.5)
+
+    def speed_diff(t):
+        dx = (tx + vx*t) - sx
+        dy = (ty + vy*t) - sy
+        dz = (tz + vz*t) - sz
+
+        eta = ARROW_DRAG
+        denom = (1.0 - eta)
+        try:
+            S = (1.0 - Math.pow(eta, t)) / denom
+        except:
+            S = t
+        if S < 1e-6:
+            S = t
+
+        v0x = dx / S
+        v0z = dz / S
+
+        try:
+            gterm = g * (t - S) / denom
+        except:
+            gterm = g * t
+        v0y = (dy + gterm) / S
+
+        s = Math.sqrt(v0x*v0x + v0y*v0y + v0z*v0z)
+        return (s - arrow_speed, (v0x, v0y, v0z), s)
+
+    N = 28
+    best_abs = 1e18
+    best_v0 = None
+    best_s = None
+    prev_f = None
+    prev_t = None
+    a = None
+    b = None
+    fa = None
+    fb = None
+    for i in range(N):
+        t = t_min + (t_max - t_min) * (i / (N - 1))
+        f, v0, s = speed_diff(t)
+        af = abs(f)
+        if af < best_abs:
+            best_abs = af
+            best_v0 = v0
+            best_s = s
+        if prev_f is not None and f * prev_f <= 0.0:
+            a, b = prev_t, t
+            fa, fb = prev_f, f
+            break
+        prev_f = f
+        prev_t = t
+
+    if a is not None:
+        for _ in range(22):
+            mid = 0.5 * (a + b)
+            f, v0, s = speed_diff(mid)
+            if abs(f) < best_abs:
+                best_abs = abs(f)
+                best_v0 = v0
+                best_s = s
+            if f * fa <= 0.0:
+                b, fb = mid, f
+            else:
+                a, fa = mid, f
+
+    if best_v0 is None or best_s is None or best_s <= 1e-9:
+        return None
+    v0x, v0y, v0z = best_v0
+    inv = 1.0 / best_s
+    return (v0x*inv, v0y*inv, v0z*inv)
+
+def lock_on(player, target):
+    N_AVG = N_AVG_SAMPLES
+
+    arrow_speed = _bow_speed(player)
+    if arrow_speed is None:
+        return
+
+    try:
+        shooter_pos = _pos_tuple(player)
+        tp = _pos_tuple(target)
+        target_pos = (tp[0], tp[1] - TARGET_Y_BIAS, tp[2])
+        target_vel = _avg_velocity_for(target, N_AVG)
+    except Exception as e:
+        try:
+            m.echo("[aim] pos/vel fetch failed: " + str(e))
+        except:
+            pass
+        return
+
+    try:
+        vx, vy, vz = target_vel
+        try:
+            try:
+                key = target.getUUID()
+            except:
+                key = target.getId()
+            hist = _velocity_history.get(key, [])
+            if hist is not None and len(hist) >= 2:
+                ax = hist[-1][0] - hist[-2][0]
+                ay = hist[-1][1] - hist[-2][1]
+                az = hist[-1][2] - hist[-2][2]
+            else:
+                ax = ay = az = 0.0
+        except:
+            ax = ay = az = 0.0
+        tlead = float(RELEASE_DELAY_TICKS) + _get_latency_ticks() + float(LEAD_EXTRA_TICKS)
+        lead_pos = (target_pos[0] + vx * tlead + 0.5 * ax * tlead * tlead,
+                    target_pos[1] + vy * tlead + 0.5 * ay * tlead * tlead,
+                    target_pos[2] + vz * tlead + 0.5 * az * tlead * tlead)
+        direction = _solve_ballistic_dir(shooter_pos, lead_pos, target_vel, arrow_speed)
+    except Exception as e:
+        try:
+            m.echo("[aim] solver failed: " + str(e))
+        except:
+            pass
+        direction = None
+
+    if direction is None:
+        dx = target_pos[0] - shooter_pos[0]
+        dy = target_pos[1] - shooter_pos[1]
+        dz = target_pos[2] - shooter_pos[2]
+        lsq = dx*dx + dy*dy + dz*dz
+        if lsq > 1e-12:
+            invl = 1.0 / Math.sqrt(lsq)
+            direction = (dx*invl, dy*invl, dz*invl)
+        else:
+            direction = _view_vec_from_rot(player)
+
+    try:
+        dx, dy, dz = float(direction[0]), float(direction[1]), float(direction[2])
+    except Exception as e:
+        try:
+            m.echo("[aim] bad direction: " + str(direction))
+        except:
+            pass
+        return
+
+    yaw   = Math.toDegrees(Math.atan2(-dx, dz))
+    vy = dy
+    if vy > 1.0:
+        vy = 1.0
+    elif vy < -1.0:
+        vy = -1.0
+    pitch = Math.toDegrees(-Math.asin(vy))
+    return (float(yaw), float(pitch))
+
+def _fire_with_cleanup(spd):
+    global _aiming, _current_target, _lock_on_active
+    try:
+      m.player_press_use(False)
+    except:
+      pass
+    if REPEAT_SHOTS_WHEN_ACTIVE:
+      try:
+        m.set_timeout(lambda: m.player_press_use(True), 75)
+      except:
+        pass
+    else:
+      _aiming = False
+      _current_target = None
+      _lock_on_active = False
+      try:
+        m.echo("[tick] shot fired at spd=" + str(round(spd,3)) + "; Lock: OFF")
+      except:
+        pass
+
+def _get_crosshair_entity():
+    data = m.player_get_targeted_entity(MAX_TARGET_DISTANCE, False)
+    if data is None:
+        return None
+    try:
+        eid = data.id
+    except:
+        eid = data["id"]
+    level = mc.level
+    if level is None:
+        return None
+    return level.getEntity(eid)
+
+def _is_bad_target(entity):
+    if entity is None:
+        return True
+    try:
+        if entity.isRemoved():
+            return True
+    except:
+        pass
+    try:
+        dist = mc.player.distanceTo(entity)
+        if dist > MAX_TARGET_DISTANCE:
+            return True
+    except:
+        pass
+    return False
+
+def _find_best_entity_in_cone():
+    eds = m.entities(False, None, None, None, None, None, None, MAX_TARGET_DISTANCE, "nearest", 64)
+    if eds is None:
+        return None
+
+    ep = mc.player.getEyePosition()
+    eye = (float(ep.x), float(ep.y), float(ep.z))
+    try:
+        vv = mc.player.getViewVector(1.0).normalize()
+        view = (float(vv.x), float(vv.y), float(vv.z))
+    except:
+        view = _view_vec_from_rot(mc.player)
+    cos_thresh = Math.cos(Math.toRadians(AIM_CONE_DEGREES))
+
+    best = None
+    best_dot = -2.0
+    best_dist = 1e18
+
+    level = mc.level
+    if level is None:
+        return None
+
+    count = 0
+    for e in eds:
+        try:
+            count += 1
+            try:
+                if e.local:
+                    continue
+            except:
+                pass
+
+            ent = level.getEntity(e.id)
+            if ent is None:
+                continue
+
+            try:
+                if e.health is None:
+                    pass
+            except:
+                pass
+
+            try:
+                tp = ent.getEyePosition()
+            except:
+                try:
+                    tp = ent.getBoundingBox().getCenter()
+                except:
+                    continue
+            tpos = (float(tp.x), float(tp.y), float(tp.z))
+
+            dx = tpos[0] - eye[0]
+            dy = tpos[1] - eye[1]
+            dz = tpos[2] - eye[2]
+            dist = Math.sqrt(dx*dx + dy*dy + dz*dz)
+            if dist <= 0.0 or dist > MAX_TARGET_DISTANCE:
+                continue
+
+            invl = 1.0 / dist
+            dir_to = (dx*invl, dy*invl, dz*invl)
+            dot = dir_to[0]*view[0] + dir_to[1]*view[1] + dir_to[2]*view[2]
+
+            if dot < cos_thresh:
+                continue
+
+            if dot > best_dot + 1e-9 or (abs(dot - best_dot) <= 1e-9 and dist < best_dist):
+                best = ent
+                best_dot = dot
+                best_dist = dist
+        except:
+            pass
+
+    return best
+
+def _acquire_target():
+    t = _get_crosshair_entity()
+    if t is not None and not _is_bad_target(t):
+        return t
+    c = _find_best_entity_in_cone()
+    return c
+
+def _begin_lock_and_fire():
+    global _current_target, _aiming, _lock_on_active
+    if not ACTIVE:
+        return
+    speed = _bow_speed(mc.player)
+    if speed is None:
+        m.echo("Equip a bow in main hand to lock-on.")
+        return
+
+    target = _acquire_target()
+    if target is None:
+        m.echo("No target in view cone.")
+        return
+
+    _current_target = target
+    try:
+      try:
+        key = target.getUUID()
+      except:
+        key = target.getId()
+      _velocity_history[key] = []
+    except:
+      pass
+    _lock_on_active = True
+    _aiming = True
+    m.player_press_use(True)
+
+def _toggle_lock():
+    global _lock_on_active
+    if _lock_on_active:
+        _lock_on_active = False
+        _cancel_lock()
+        m.echo("Lock: OFF")
+    else:
+        _begin_lock_and_fire()
+        if _lock_on_active:
+            m.echo("Lock: ON")
+
+def _cancel_lock():
+    global _current_target, _aiming
+    _aiming = False
+    _current_target = None
+    m.player_press_use(False)
+
+def _on_key(event):
+    if event.action != 1:
+        return
+    if event.key == CANCEL_HOTKEY or event.key == 'o' or event.key == 'O':
+        _cancel_lock()
+        m.echo("Lock: OFF")
+
+def _on_mouse(event):
+    try:
+        if event.action == 1 and event.button == 0:
+            _toggle_lock()
+    except:
+        pass
+
+def _on_tick(event):
+    global _current_target, _aiming, _lock_on_active, _hold_ticks_remaining, _hold_yaw, _hold_pitch
+    if _hold_ticks_remaining > 0:
+        try:
+            m.player_set_orientation(_hold_yaw, _hold_pitch)
+        except:
+            pass
+        _hold_ticks_remaining -= 1
+
+    if not _lock_on_active:
+        return
+
+    if _current_target is None or _is_bad_target(_current_target):
+        _cancel_lock()
+        _lock_on_active = False
+        return
+
+    if _bow_speed(mc.player) is None:
+        m.echo("[tick] cancel: bow missing/not in main hand")
+        _cancel_lock()
+        return
+
+    try:
+        _avg_velocity_for(_current_target)
+        spd = _bow_speed(mc.player)
+        if spd is not None and (spd / ARROW_SPEED_SCALE) >= (FULL_DRAW_THRESHOLD - DRAW_EPS):
+            res = lock_on(mc.player, _current_target)
+            if res is not None:
+                try:
+                    yaw, pitch = res
+                    m.player_set_orientation(yaw, pitch)
+                    _hold_yaw = float(yaw)
+                    _hold_pitch = float(pitch)
+                    _hold_ticks_remaining = POST_RELEASE_HOLD_TICKS
+                except:
+                    pass
+            try:
+                m.set_timeout(_fire_with_cleanup, 0, spd)
+            except:
+                _fire_with_cleanup(spd)
+    except Exception as e:
+        try:
+            m.echo("[tick] lock_on exception: " + str(e))
+        except:
+            pass
+        return
+
+if _tick_listener is None:
+    m.add_event_listener("key", _on_key)
+    m.add_event_listener("mouse", _on_mouse)
+    _tick_listener = m.add_event_listener("tick", _on_tick)
+    try:
+        ck = chr(CANCEL_HOTKEY)
+    except:
+        ck = 'O'
+    m.echo(f"[Bow Aimbot] Lock: Mouse1  Cancel: {ck}")
