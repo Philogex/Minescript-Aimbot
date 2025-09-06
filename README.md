@@ -1,6 +1,6 @@
 # Bow Aimbot (Minescript / Pyjinn)
 
-Single‑file bow aimbot for Minecraft using Minescript (Pyjinn). Computes a ballistic intercept with configurable gravity/drag, smooth velocity averaging, ping‑aware release timing, and center‑mass bias.
+Single-file bow aimbot for Minecraft using Minescript (Pyjinn). Computes a ballistic intercept with configurable gravity/drag, smooth velocity averaging, ping-aware release timing, and an adjustable aim bias.
 
 ---
 
@@ -23,11 +23,12 @@ mv Minescript-Aimbot <minescript-directory>
 
 - Run the script (Pyjinn) in Minescript.
 - Controls:
-  - Mouse1: toggle lock‑on (starts drawing and aims when ready)
-  - `O`: cancel/stop (releases right‑click if held)
+  - Mouse1: toggle lock-on (starts drawing and aims when ready)
+  - `O`: cancel/stop (releases right-click if held)
 
 Behavior:
-- On lock, it selects the entity under the crosshair or the best in a small view‑cone.
+- On lock, it selects the entity under the crosshair or the best in a small view-cone.
+- While locked, it updates target position/velocity every tick to keep the sliding window fresh.
 - It draws the bow, waits until full draw, then computes the intercept and snaps aim just before releasing.
 - It holds orientation for a couple ticks to cover arrow spawn delay.
 
@@ -47,7 +48,14 @@ All options are at the top of `bow_aimbot.pyj`:
 - `ARROW_GRAVITY`, `ARROW_DRAG`, `ARROW_SPEED_SCALE`: arrow physics
 - `FULL_DRAW_THRESHOLD`, `DRAW_EPS`: release at full draw
 - `AIM_CONE_DEGREES`, `MAX_TARGET_DISTANCE`: acquisition cone/range
-- `TARGET_Y_BIAS`: aim a bit below eyes (center‑mass)
+- `TARGET_Y_BIAS`: vertical offset applied to the target anchor
+- `VELOCITY_SOURCE`: `derived`, `server`, or `blend`
+- `DERIVED_WINDOW`: number of past samples for derived velocity
+- `DERIVED_MAX_SPEED`: cap for derived velocity magnitude (blocks/tick)
+- `DERIVED_SOURCE_WEIGHT`: when `blend`, weight for derived vs server velocity
+
+Aim anchor:
+- Targets the entity eye position when available, otherwise the bounding-box center, otherwise base position. `TARGET_Y_BIAS` offsets this up/down from the anchor.
 
 Notes:
 - Lead time also adds your network latency (ms/50) in multiplayer.
@@ -55,7 +63,7 @@ Notes:
 
 ### CLI Overrides (optional)
 
-You can override a few settings when launching the script; if omitted, the in‑file defaults are used.
+You can override a few settings when launching the script; if omitted, the in-file defaults are used.
 
 Examples:
 
@@ -76,6 +84,10 @@ Supported flags:
 - `--vel-alpha=<float>` (EMA alpha)
 - `--n-avg=<int>` (window size)
 - `--vel-instant=<float>` (instantaneous weight 0..1)
+- `--vel-source=derived|server|blend`
+- `--derived-window=<int>`
+- `--derived-max=<float>`
+- `--derived-weight=<float>` (0..1)
 
 ---
 

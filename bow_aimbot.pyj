@@ -6,11 +6,6 @@ Math = JavaClass("java.lang.Math")
 BowItem = JavaClass("net.minecraft.world.item.BowItem")
 JString = JavaClass("java.lang.String")
 
-def _vec3_ctor():
-    V = JavaClass("net.minecraft.world.phys.Vec3")
-    return lambda x,y,z: V(x, y, z)
-Vec3 = _vec3_ctor()
-
 # ------------------------------
 # config
 # ------------------------------
@@ -29,10 +24,14 @@ N_AVG_SAMPLES = 4
 ARROW_GRAVITY = 0.05
 ARROW_DRAG = 0.99
 ARROW_SPEED_SCALE = 3.00
-VELOCITY_INSTANT_WEIGHT = 0.2
-TARGET_Y_BIAS = 0.50
+VELOCITY_INSTANT_WEIGHT = 0.0
+TARGET_Y_BIAS = 0.6
 VELOCITY_SMOOTHING = "avg"   # one of: latest, ema, avg
 VELOCITY_EMA_ALPHA = 0.6
+VELOCITY_SOURCE = "derived"   # one of: derived, server, blend
+DERIVED_WINDOW = 4
+DERIVED_MAX_SPEED = 1.0
+DERIVED_SOURCE_WEIGHT = 0.8
 
 # ------------------------------
 # don't touch
@@ -43,6 +42,7 @@ ACTIVE = True
 mc = Minecraft.getInstance()
 _velocity_history = {}
 _velocity_ema = {}
+_pos_history = {}
 
 _current_target = None
 _aiming = False
@@ -80,6 +80,144 @@ def _vel_tuple(entity):
         return (float(v.x), float(v.y), float(v.z))
     except:
         return (0.0, 0.0, 0.0)
+
+def _entity_key(entity):
+    try:
+        return entity.getUUID()
+    except:
+        try:
+            return entity.getId()
+        except:
+            return None
+
+def _push_position_sample(target, pos_tuple, window_N):
+    try:
+        try:
+            key = target.getUUID()
+        except:
+            key = target.getId()
+        if key not in _pos_history:
+            _pos_history[key] = []
+        hist = _pos_history[key]
+        try:
+            lvl = mc.level
+            tick = lvl.getGameTime() if lvl is not None else 0
+        except:
+            tick = 0
+        try:
+            x, y, z = float(pos_tuple[0]), float(pos_tuple[1]), float(pos_tuple[2])
+        except:
+            try:
+                x, y, z = float(pos_tuple.x), float(pos_tuple.y), float(pos_tuple.z)
+            except:
+                x, y, z = 0.0, 0.0, 0.0
+        hist.append((x, y, z, float(tick)))
+        if len(hist) > (window_N + 2):
+            hist.pop(0)
+        return key
+    except:
+        return None
+
+def _derived_velocity_from_positions(key, window_N):
+    hist = _pos_history.get(key, [])
+    n = len(hist)
+    if n < 2:
+        return (0.0, 0.0, 0.0)
+    count = int(window_N)
+    if count < 1:
+        count = 1
+    count = min(count, n-1)
+    base_idx = n - 1 - count
+    def _unpack_pos(entry):
+        try:
+            if len(entry) >= 4:
+                return (float(entry[0]), float(entry[1]), float(entry[2]), float(entry[3]))
+        except:
+            pass
+        try:
+            return (float(entry[0]), float(entry[1]), float(entry[2]), None)
+        except:
+            try:
+                return (float(entry.x), float(entry.y), float(entry.z), None)
+            except:
+                return (0.0, 0.0, 0.0, None)
+    p0x, p0y, p0z, t0 = _unpack_pos(hist[base_idx])
+    if t0 is None:
+        j = base_idx
+        while j < n:
+            p0x, p0y, p0z, t0 = _unpack_pos(hist[j])
+            if t0 is not None:
+                base_idx = j
+                break
+            j += 1
+    sx = 0.0
+    sy = 0.0
+    sz = 0.0
+    used = 0
+    if t0 is not None:
+        for i in range(base_idx + 1, n):
+            xi, yi, zi, ti = _unpack_pos(hist[i])
+            try:
+                dt = float(ti) - float(t0)
+            except:
+                dt = None
+            if dt is None or dt <= 0.0:
+                continue
+            dx = (xi - p0x) / dt
+            dy = (yi - p0y) / dt
+            dz = (zi - p0z) / dt
+            sx += dx; sy += dy; sz += dz
+            used += 1
+    else:
+        for i in range(base_idx + 1, n):
+            dt = i - base_idx
+            if dt <= 0:
+                continue
+            xi, yi, zi, _ = _unpack_pos(hist[i])
+            dx = (xi - p0x) / dt
+            dy = (yi - p0y) / dt
+            dz = (zi - p0z) / dt
+            sx += dx; sy += dy; sz += dz
+            used += 1
+    if used == 0:
+        return (0.0, 0.0, 0.0)
+    inv = 1.0 / used
+    vx = sx * inv; vy = sy * inv; vz = sz * inv
+    maxv = float(DERIVED_MAX_SPEED)
+    if maxv > 0.0:
+        mag2 = vx*vx + vy*vy + vz*vz
+        if mag2 > maxv*maxv and mag2 > 1e-12:
+            invmag = maxv / Math.sqrt(mag2)
+            vx *= invmag; vy *= invmag; vz *= invmag
+    return (vx, vy, vz)
+
+def _compute_instant_velocity_for_target(target):
+    try:
+        mode_src = VELOCITY_SOURCE.lower() if (type(VELOCITY_SOURCE) == JString or type(VELOCITY_SOURCE) == str) else "derived"
+    except:
+        mode_src = "derived"
+    key_pos = _entity_key(target)
+    if mode_src == "derived":
+        return _derived_velocity_from_positions(key_pos, DERIVED_WINDOW)
+    elif mode_src == "server":
+        return _vel_tuple(target)
+    else:
+        inst_d = _derived_velocity_from_positions(key_pos, DERIVED_WINDOW)
+        inst_s = _vel_tuple(target)
+        dw = float(DERIVED_SOURCE_WEIGHT)
+        return (inst_d[0]*dw + inst_s[0]*(1.0-dw),
+                inst_d[1]*dw + inst_s[1]*(1.0-dw),
+                inst_d[2]*dw + inst_s[2]*(1.0-dw))
+
+def _update_target_histories(target):
+    try:
+        tp = _pos_tuple(target)
+        _push_position_sample(target, tp, DERIVED_WINDOW)
+        inst = _compute_instant_velocity_for_target(target)
+        _smoothed_velocity_for(target, N_AVG_SAMPLES, inst_override=inst)
+        return True
+    except:
+        return False
 
 def _view_vec_from_rot(ent):
     try:
@@ -178,6 +316,7 @@ def _avg_from_history(key):
     n = 0
     for v in hist:
         try:
+            m.echo(v)
             sx += v[0]
             sy += v[1]
             sz += v[2]
@@ -189,10 +328,13 @@ def _avg_from_history(key):
     inv = 1.0 / n
     return (sx*inv, sy*inv, sz*inv)
 
-def _smoothed_velocity_for(target, window_N):
-    inst = _vel_tuple(target)
+def _smoothed_velocity_for(target, window_N, inst_override=None):
+    inst = inst_override if inst_override is not None else _vel_tuple(target)
     key = _push_velocity_sample(target, inst, window_N)
-    mode = VELOCITY_SMOOTHING.lower() if type(VELOCITY_SMOOTHING) else "avg"
+    try:
+        mode = VELOCITY_SMOOTHING.lower() if (type(VELOCITY_SMOOTHING) == JString or type(VELOCITY_SMOOTHING) == str) else "avg"
+    except:
+        mode = "avg"
     if mode == "latest":
         return inst
     if mode == "ema":
@@ -316,8 +458,18 @@ def lock_on(player, target):
         shooter_pos = _pos_tuple(player)
         tp = _pos_tuple(target)
         target_pos = (tp[0], tp[1] + TARGET_Y_BIAS, tp[2])
-        vel_smooth = _smoothed_velocity_for(target, N_AVG)
-        inst = _vel_tuple(target)
+        inst = _compute_instant_velocity_for_target(target)
+        try:
+            mode = VELOCITY_SMOOTHING.lower() if (type(VELOCITY_SMOOTHING) == JString or type(VELOCITY_SMOOTHING) == str) else "avg"
+        except:
+            mode = "avg"
+        key = _entity_key(target)
+        if mode == "latest":
+            vel_smooth = inst
+        elif mode == "ema":
+            vel_smooth = _velocity_ema.get(key, inst)
+        else:
+            vel_smooth = _avg_from_history(key)
         w = float(VELOCITY_INSTANT_WEIGHT)
         iw = 1.0 - w
         target_vel = (inst[0]*w + vel_smooth[0]*iw,
@@ -540,6 +692,11 @@ def _begin_lock_and_fire():
       except:
         key = target.getId()
       _velocity_history[key] = []
+      try:
+        _velocity_ema.pop(key, None)
+      except:
+        pass
+      _pos_history[key] = []
     except:
       pass
     _lock_on_active = True
@@ -593,6 +750,11 @@ def _on_tick(event):
         _cancel_lock()
         _lock_on_active = False
         return
+
+    try:
+        _update_target_histories(_current_target)
+    except:
+        pass
 
     if _bow_speed(mc.player) is None:
         m.echo("[tick] cancel: bow missing/not in main hand")
@@ -650,6 +812,14 @@ if _tick_listener is None:
                         N_AVG_SAMPLES = int(float(arg.split("=",1)[1]))
                     elif arg.startswith("--vel-instant="):
                         VELOCITY_INSTANT_WEIGHT = float(arg.split("=",1)[1])
+                    elif arg.startswith("--vel-source="):
+                        VELOCITY_SOURCE = arg.split("=",1)[1]
+                    elif arg.startswith("--derived-window="):
+                        DERIVED_WINDOW = int(float(arg.split("=",1)[1]))
+                    elif arg.startswith("--derived-max="):
+                        DERIVED_MAX_SPEED = float(arg.split("=",1)[1])
+                    elif arg.startswith("--derived-weight="):
+                        DERIVED_SOURCE_WEIGHT = float(arg.split("=",1)[1])
                 except:
                     pass
     except:
